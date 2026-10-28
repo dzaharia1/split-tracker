@@ -1,6 +1,7 @@
 import webPush from 'web-push';
 import {
   getPushSubscriptionsForGroupMembers,
+  getPushSubscriptionsForUser,
   deletePushSubscriptionByEndpoint,
 } from './db.js';
 
@@ -73,6 +74,43 @@ export async function sendExpenseNotification({ group, creatorId, expense, payer
       }
     }
   }));
+}
+
+export async function sendPaymentRequestNotification({ group, requesterId, requesterName, recipientId, amount, note }) {
+  if (!configured) return { sent: 0, reason: 'not_configured' };
+  if (group.is_demo) return { sent: 0, reason: 'demo_group' };
+
+  const subs = getPushSubscriptionsForUser(recipientId);
+  if (!subs.length) return { sent: 0, reason: 'no_subscriptions' };
+
+  const formatted = formatAmount(amount);
+  const senderDisp = requesterName?.split(' ')[0] || requesterName || 'Someone';
+  const title = `Payment request in ${group.name}`;
+  const body = note
+    ? `${senderDisp} requested ${formatted} · ${note}`
+    : `${senderDisp} requested ${formatted} from you`;
+  const url = `/groups/${group.id}`;
+  const tag = `request-${group.id}-${requesterId}-${Date.now()}`;
+
+  let sent = 0;
+  await Promise.all(subs.map(async sub => {
+    const payload = JSON.stringify({ title, body, url, tag });
+    const subscription = {
+      endpoint: sub.endpoint,
+      keys: { p256dh: sub.p256dh, auth: sub.auth },
+    };
+    try {
+      await webPush.sendNotification(subscription, payload);
+      sent++;
+    } catch (err) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        deletePushSubscriptionByEndpoint(sub.endpoint);
+      } else {
+        console.error('push send failed:', err.statusCode, err.body || err.message);
+      }
+    }
+  }));
+  return { sent, reason: sent > 0 ? 'ok' : 'delivery_failed' };
 }
 
 function formatAmount(v) {
