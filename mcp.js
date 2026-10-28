@@ -27,14 +27,17 @@ import {
   declineInvite,
   removeMember,
   getGroupExpenses,
+  getGroupSettlements,
   createExpense,
   getExpenseById,
+  updateExpense,
   deleteExpense,
   updatePaymentHandles,
   updateExpenseClassification,
 } from './db.js';
 import { sendInviteEmail } from './mail.js';
 import { classifyExpense } from './icon-picker.js';
+import { sendPaymentRequestNotification } from './push.js';
 import { SplitTrackerOAuthProvider, googleBridgeCallback } from './oauth-provider.js';
 
 function baseUrl() {
@@ -91,8 +94,39 @@ function makeMemberResolver(members) {
   };
 }
 
+// Largest-remainder allocation in integer cents (matching public/js/events.js)
+// so percentage-based splits always sum to the exact total to the penny.
+function allocatePercentagesToAmounts(totalAmount, pcts) {
+  const totalCents = Math.round(totalAmount * 100);
+  const raw = pcts.map(p => (totalCents * p) / 100);
+  const cents = raw.map(r => Math.floor(r + 1e-9));
+  let leftover = totalCents - cents.reduce((a, b) => a + b, 0);
+  if (leftover > 0) {
+    const byFracDesc = raw
+      .map((r, i) => ({ i, frac: r - Math.floor(r + 1e-9) }))
+      .sort((a, b) => b.frac - a.frac || a.i - b.i);
+    for (let k = 0; k < leftover; k++) {
+      cents[byFracDesc[k % byFracDesc.length].i]++;
+    }
+  } else if (leftover < 0) {
+    const byFracAsc = raw
+      .map((r, i) => ({ i, frac: r - Math.floor(r + 1e-9) }))
+      .sort((a, b) => a.frac - b.frac || b.i - a.i);
+    let idx = 0;
+    while (leftover < 0 && idx < byFracAsc.length * (totalCents + 1)) {
+      const target = byFracAsc[idx % byFracAsc.length].i;
+      if (cents[target] > 0) {
+        cents[target]--;
+        leftover++;
+      }
+      idx++;
+    }
+  }
+  return cents.map(c => c / 100);
+}
+
 // Build an MCP server whose tools all act as `userId` (from the bearer token).
-function buildMcpServer(userId) {
+export function buildMcpServer(userId) {
   const server = new McpServer({ name: 'split-tracker', version: '1.0.0' });
   const me = getUserById(userId);
 
@@ -334,6 +368,242 @@ function buildMcpServer(userId) {
     );
   });
 
+  server.registerTool('edit_expense', {
+    description: [
+      'Edit an existing non-settlement expense in a group you belong to, supporting every field on the "Edit item" form. Any group member may edit an expense; pass only the fields you want to change (omitted fields keep their current values).',
+      'paid_by and split_participants accept a member id, name, email, or "me"/"myself" — you do NOT need to look up ids first.',
+      '',
+      'Split options (matching the "Edit item" form):',
+      '• "equal" — split evenly. Optionally pass split_participants to split among a subset, or omit split_participants (when setting split_type: "equal") to split among everyone.',
+      '• "full" — one or more members owe the WHOLE amount to paid_by (covers both "You owe full amount" and "They owe full amount"). Pass split_participants listing who owes the full amount.',
+      '• "custom" (by amount) — uneven split by dollar amount. Pass split_participants AND split_amounts as parallel arrays (same length) summing to the total amount (include the payer if the payer owes a share).',
+      '• "percentage" (or "custom" with split_percentages) — uneven split by percentage. Pass split_participants AND split_percentages as parallel arrays (same length) summing to 100; dollar shares are computed to the cent automatically.',
+    ].join('\n'),
+    inputSchema: {
+      group_id: z.number().int(),
+      expense_id: z.number().int(),
+      name: z.string().min(1).optional(),
+      amount: z.number().positive().optional(),
+      paid_by: z.union([z.number().int(), z.string()]).optional(),
+      split_type: z.enum(['equal', 'custom', 'percentage', 'full']).optional(),
+      split_participants: z.array(z.union([z.number().int(), z.string()])).optional(),
+      split_amounts: z.array(z.number()).optional(),
+      split_percentages: z.array(z.number()).optional(),
+    },
+  }, async (args) => {
+    const { group_id, expense_id } = args;
+    const group = getGroup(group_id);
+    if (!group) return fail('Group not found.');
+    if (group.is_demo) return fail('Cannot edit expenses in a demo group.');
+    if (!isGroupMember(group_id, userId)) return fail('You are not a member of this group.');
+
+    const expense = getExpenseById(expense_id);
+    if (!expense || expense.group_id !== group_id) return fail('Expense not found.');
+    if (expense.settled_with || expense.category === 'settlement') {
+      return fail('Payments cannot be edited.');
+    }
+
+    const splitTouched =
+      args.split_type !== undefined ||
+      args.split_participants !== undefined ||
+      args.split_amounts !== undefined ||
+      args.split_percentages !== undefined;
+
+    if (args.name === undefined && args.amount === undefined && args.paid_by === undefined && !splitTouched) {
+      return fail('Provide at least one field to update (name, amount, paid_by, or split options).');
+    }
+
+    let name = expense.name;
+    if (args.name !== undefined) {
+      name = decodeEntities(args.name.trim());
+      if (!name) return fail('Name is required.');
+    }
+
+    const amount = args.amount !== undefined ? args.amount : expense.amount;
+
+    const members = getGroupMembers(group_id);
+    const nameOf = (id) => members.find(m => m.id === id)?.name || `#${id}`;
+    const resolve = makeMemberResolver(members);
+    const resolveRef = (value) => /^(me|myself)$/i.test(String(value).trim()) ? { id: userId } : resolve(value);
+
+    let paidBy = expense.paid_by;
+    if (args.paid_by != null) {
+      const r = resolveRef(args.paid_by);
+      if (r.error) return fail(`paid_by: ${r.error}`);
+      paidBy = r.id;
+    }
+
+    if (args.split_amounts !== undefined && args.split_percentages !== undefined) {
+      return fail('Pass either split_amounts (split by amount) or split_percentages (split by percentage), not both.');
+    }
+
+    let passedParticipants = null;
+    if (args.split_participants !== undefined) {
+      passedParticipants = [];
+      for (const ref of args.split_participants) {
+        const r = resolveRef(ref);
+        if (r.error) return fail(`split_participants: ${r.error}`);
+        passedParticipants.push(r.id);
+      }
+      if (new Set(passedParticipants).size !== passedParticipants.length) {
+        return fail('split_participants contains duplicate members.');
+      }
+    }
+
+    let splitType = expense.split_type || 'equal';
+    let splitParticipants = expense.split_participants;
+    let splitAmounts = expense.split_amounts;
+    let splitPercentages = expense.split_percentages;
+
+    if (!splitTouched) {
+      if (splitType === 'custom' && Math.round(amount * 100) !== Math.round(expense.amount * 100)) {
+        if (expense.split_percentages) {
+          const existingPcts = JSON.parse(expense.split_percentages);
+          splitAmounts = JSON.stringify(allocatePercentagesToAmounts(amount, existingPcts));
+        } else {
+          return fail(
+            `This expense uses a custom dollar split summing to $${expense.amount.toFixed(2)}, which doesn't match the new amount ($${amount.toFixed(2)}). Also pass split_participants and split_amounts (or split_percentages, or change split_type).`
+          );
+        }
+      }
+    } else {
+      if (args.split_amounts !== undefined && args.split_type && args.split_type !== 'custom') {
+        return fail(`split_amounts can only be used with split_type "custom" (got "${args.split_type}").`);
+      }
+      if (args.split_percentages !== undefined && args.split_type && args.split_type !== 'custom' && args.split_type !== 'percentage') {
+        return fail(`split_percentages can only be used with split_type "percentage" or "custom" (got "${args.split_type}").`);
+      }
+
+      const isPctMode = args.split_type === 'percentage' || args.split_percentages !== undefined;
+      const isAmtMode = !isPctMode && (args.split_type === 'custom' || args.split_amounts !== undefined);
+      const isFullMode = !isPctMode && !isAmtMode && (args.split_type === 'full' || (args.split_type === undefined && expense.split_type === 'full'));
+
+      if (isPctMode) {
+        const pcts = args.split_percentages?.map(Number) ?? null;
+        if (!passedParticipants || !pcts) {
+          return fail('A percentage split needs both split_participants and split_percentages (parallel arrays).');
+        }
+        if (passedParticipants.length !== pcts.length) {
+          return fail(`split_participants (${passedParticipants.length}) and split_percentages (${pcts.length}) must have the same length — one percentage per participant.`);
+        }
+        if (!passedParticipants.length) return fail('A percentage split needs at least one participant.');
+        if (pcts.some(p => !Number.isFinite(p) || p < 0)) {
+          return fail('split_percentages must be non-negative numbers.');
+        }
+        const pctSum = pcts.reduce((a, b) => a + b, 0);
+        if (Math.round(pctSum * 100) !== 10000) {
+          return fail(`split_percentages add up to ${pctSum.toFixed(2)}% but must add up to 100%.`);
+        }
+        const computedAmounts = allocatePercentagesToAmounts(amount, pcts);
+        splitType = 'custom';
+        splitParticipants = JSON.stringify(passedParticipants);
+        splitAmounts = JSON.stringify(computedAmounts);
+        splitPercentages = JSON.stringify(pcts);
+      } else if (isAmtMode) {
+        const amounts = args.split_amounts?.map(Number) ?? null;
+        if (!passedParticipants || !amounts) {
+          return fail('A custom split needs both split_participants and split_amounts (parallel arrays) — or pass split_percentages to split by percentage.');
+        }
+        if (passedParticipants.length !== amounts.length) {
+          return fail(`split_participants (${passedParticipants.length}) and split_amounts (${amounts.length}) must have the same length — one amount per participant.`);
+        }
+        if (!passedParticipants.length) return fail('A custom split needs at least one participant.');
+        if (amounts.some(a => !Number.isFinite(a) || a < 0)) {
+          return fail('split_amounts must be non-negative numbers.');
+        }
+        const sum = amounts.reduce((a, b) => a + b, 0);
+        if (Math.round(sum * 100) !== Math.round(amount * 100)) {
+          return fail(`split_amounts add up to ${sum.toFixed(2)} but the total is ${amount.toFixed(2)}. They must match — include the payer's own share if the payer owes part of it.`);
+        }
+        splitType = 'custom';
+        splitParticipants = JSON.stringify(passedParticipants);
+        splitAmounts = JSON.stringify(amounts);
+        splitPercentages = null;
+      } else if (isFullMode) {
+        const existingFull = expense.split_type === 'full' && expense.split_participants
+          ? JSON.parse(expense.split_participants)
+          : null;
+        const fullParticipants = passedParticipants ?? existingFull;
+        if (!fullParticipants || !fullParticipants.length) {
+          return fail('A "full" split needs split_participants: the member(s) who owe the whole amount to the payer.');
+        }
+        splitType = 'full';
+        splitParticipants = JSON.stringify(fullParticipants);
+        splitAmounts = null;
+        splitPercentages = null;
+      } else {
+        // Equal split
+        if (args.split_type === undefined && expense.split_type === 'custom') {
+          return fail('This expense uses a custom split. Pass split_amounts or split_percentages along with split_participants, or set split_type to "equal" or "full".');
+        }
+        splitType = 'equal';
+        if (passedParticipants !== null) {
+          if (!passedParticipants.length) {
+            return fail('split_participants cannot be empty — omit it to split equally among everyone, or list at least one member.');
+          }
+          const allMemberIds = new Set(members.map(m => m.id));
+          const isEveryone = passedParticipants.length === members.length && passedParticipants.every(id => allMemberIds.has(id));
+          splitParticipants = isEveryone ? null : JSON.stringify(passedParticipants);
+        } else {
+          splitParticipants = null;
+        }
+        splitAmounts = null;
+        splitPercentages = null;
+      }
+    }
+
+    const nameChanged = name !== expense.name;
+    const category = nameChanged ? 'general' : expense.category;
+    const icon = nameChanged ? null : expense.icon;
+
+    updateExpense(expense_id, {
+      name,
+      amount,
+      category,
+      paidBy,
+      splitType,
+      splitParticipants,
+      splitAmounts,
+      splitPercentages,
+      icon,
+    });
+
+    if (nameChanged) {
+      classifyExpense({ name })
+        .then(({ icon: newIcon, category: cat }) => updateExpenseClassification(expense_id, newIcon, cat))
+        .catch(err => console.error('classifyExpense after edit failed:', err.message));
+    }
+
+    const parsedParts = splitParticipants ? JSON.parse(splitParticipants) : null;
+    const parsedAmts = splitAmounts ? JSON.parse(splitAmounts) : null;
+    const parsedPcts = splitPercentages ? JSON.parse(splitPercentages) : null;
+
+    let splitNote = 'Split equally.';
+    if (splitType === 'custom' && parsedPcts && parsedParts && parsedAmts) {
+      splitNote = `Split by percentage: ${parsedParts.map((p, i) => `${nameOf(p)} ${parsedPcts[i]}% ($${parsedAmts[i].toFixed(2)})`).join(', ')}.`;
+    } else if (splitType === 'custom' && parsedParts && parsedAmts) {
+      splitNote = `Custom split: ${parsedParts.map((p, i) => `${nameOf(p)} $${parsedAmts[i]}`).join(', ')}.`;
+    } else if (splitType === 'full' && parsedParts) {
+      splitNote = `Owed in full by ${parsedParts.map(nameOf).join(', ')}.`;
+    } else if (parsedParts) {
+      splitNote = `Split equally among ${parsedParts.map(nameOf).join(', ')}.`;
+    }
+
+    return ok(
+      `Updated expense #${expense_id} "${name}" ($${amount}, paid by ${nameOf(paidBy)}). ${splitNote}`,
+      {
+        id: expense_id,
+        name,
+        amount,
+        paid_by: paidBy,
+        split_type: splitType,
+        split_participants: parsedParts,
+        split_amounts: parsedAmts,
+        split_percentages: parsedPcts,
+      }
+    );
+  });
+
   server.registerTool('delete_expense', {
     description: 'Delete an expense. Allowed if you paid it or you own the group.',
     inputSchema: { group_id: z.number().int(), expense_id: z.number().int() },
@@ -346,6 +616,77 @@ function buildMcpServer(userId) {
     }
     deleteExpense(expense_id);
     return ok(`Deleted expense #${expense_id}.`, { expenseId: expense_id });
+  });
+
+  server.registerTool('request', {
+    description: [
+      'Nudge a group member who owes you money in a group by sending them a push notification reminder (leaves the balance unsettled).',
+      'member accepts a member id, name, or email — you do NOT need to look up ids first.',
+      'The amount owed is calculated automatically from the group balance.',
+    ].join('\n'),
+    inputSchema: {
+      group_id: z.number().int(),
+      member: z.union([z.number().int(), z.string()]),
+      note: z.string().max(200).optional(),
+    },
+  }, async ({ group_id, member, note }) => {
+    const group = getGroup(group_id);
+    if (!group) return fail('Group not found.');
+    if (!isGroupMember(group_id, userId)) return fail('You are not a member of this group.');
+    if (group.is_demo) return fail('Cannot send payment requests in a demo group.');
+
+    if (/^(me|myself)$/i.test(String(member).trim())) {
+      return fail('You cannot send a payment request to yourself.');
+    }
+
+    const members = getGroupMembers(group_id);
+    const resolve = makeMemberResolver(members);
+    const resolved = resolve(member);
+    if (resolved.error) return fail(resolved.error);
+    if (resolved.id === userId) return fail('You cannot send a payment request to yourself.');
+
+    const target = members.find(m => m.id === resolved.id);
+    const settlements = getGroupSettlements(group_id);
+    const owedToMe = settlements.find(s => s.from === target.id && s.to === userId);
+    if (!owedToMe) {
+      const iOweThem = settlements.find(s => s.from === userId && s.to === target.id);
+      if (iOweThem) {
+        return fail(`${target.name} doesn't owe you in "${group.name}" — you owe ${target.name} $${iOweThem.amt.toFixed(2)}.`);
+      }
+      return fail(`${target.name} doesn't owe you anything in "${group.name}".`);
+    }
+
+    const trimmedNote = note ? decodeEntities(note.trim()) : '';
+    const requester = getUserById(userId) || me;
+    const pushResult = await sendPaymentRequestNotification({
+      group,
+      requesterId: userId,
+      requesterName: requester?.name,
+      recipientId: target.id,
+      amount: owedToMe.amt,
+      note: trimmedNote || undefined,
+    });
+
+    if (pushResult.reason === 'not_configured') {
+      return fail('Push notifications are not configured on this server.');
+    }
+    if (pushResult.reason === 'no_subscriptions') {
+      return fail(`${target.name} does not have push notifications enabled.`);
+    }
+    if (!pushResult.sent) {
+      return fail(`Failed to deliver push notification to ${target.name}.`);
+    }
+
+    return ok(
+      `Sent a payment request notification to ${target.name} for $${owedToMe.amt.toFixed(2)} in "${group.name}".`,
+      {
+        groupId: group_id,
+        memberId: target.id,
+        memberName: target.name,
+        amount: owedToMe.amt,
+        devicesNotified: pushResult.sent,
+      }
+    );
   });
 
   server.registerTool('update_payment_handles', {

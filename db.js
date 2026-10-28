@@ -213,6 +213,15 @@ export function getPushSubscriptionsForGroupMembers(groupId, excludeUserId) {
   `).all(groupId, excludeUserId);
 }
 
+export function getPushSubscriptionsForUser(userId) {
+  return db.prepare(`
+    SELECT ps.user_id, ps.endpoint, ps.p256dh, ps.auth
+    FROM push_subscriptions ps
+    JOIN users u ON u.id = ps.user_id
+    WHERE ps.user_id = ? AND u.push_enabled = 1
+  `).all(userId);
+}
+
 // --- Group helpers ---
 
 export function getUserGroups(userId, showDemo = false) {
@@ -304,6 +313,94 @@ export function getUserGroupBalance(groupId, userId) {
     }
   }
   return { balance: bal / 100, expenseCount: expenses.length };
+}
+
+export function getGroupSettlements(groupId) {
+  const members = getGroupMembers(groupId);
+  const expenses = getGroupExpenses(groupId);
+  if (!expenses.length || !members.length) return [];
+
+  const allIds = members.map(m => m.id);
+  const bal = new Map(members.map(m => [m.id, 0])); // integer cents
+
+  for (const ex of expenses) {
+    const total = Math.round(ex.amount * 100);
+    if (ex.settled_with) {
+      if (bal.has(ex.paid_by)) bal.set(ex.paid_by, bal.get(ex.paid_by) + total);
+      if (bal.has(ex.settled_with)) bal.set(ex.settled_with, bal.get(ex.settled_with) - total);
+    } else if (ex.split_type === 'full') {
+      const owes = ex.split_participants ? JSON.parse(ex.split_participants) : [];
+      if (owes.length) {
+        if (bal.has(ex.paid_by)) bal.set(ex.paid_by, bal.get(ex.paid_by) + total);
+        const shares = equalShareCents(total, owes, ex.paid_by);
+        for (const pid of owes) {
+          if (bal.has(pid)) bal.set(pid, bal.get(pid) - shares.get(pid));
+        }
+      }
+    } else if (ex.split_type === 'custom') {
+      const customParts = ex.split_participants ? JSON.parse(ex.split_participants) : [];
+      const customAmts = ex.split_amounts ? JSON.parse(ex.split_amounts) : [];
+      if (customParts.length) {
+        if (bal.has(ex.paid_by)) bal.set(ex.paid_by, bal.get(ex.paid_by) + total);
+        customParts.forEach((pid, i) => {
+          const owed = Math.round((customAmts[i] || 0) * 100);
+          if (bal.has(pid)) bal.set(pid, bal.get(pid) - owed);
+        });
+      }
+    } else {
+      let participants = ex.split_participants ? JSON.parse(ex.split_participants) : allIds;
+      if (!participants.length) participants = allIds;
+      const shares = equalShareCents(total, participants, ex.paid_by);
+      const payerInList = participants.includes(ex.paid_by);
+      if (payerInList) {
+        for (const pid of participants) {
+          if (pid === ex.paid_by) {
+            if (bal.has(pid)) bal.set(pid, bal.get(pid) + total - shares.get(pid));
+          } else if (bal.has(pid)) {
+            bal.set(pid, bal.get(pid) - shares.get(pid));
+          }
+        }
+      } else {
+        if (bal.has(ex.paid_by)) bal.set(ex.paid_by, bal.get(ex.paid_by) + total);
+        for (const pid of participants) {
+          if (bal.has(pid)) bal.set(pid, bal.get(pid) - shares.get(pid));
+        }
+      }
+    }
+  }
+
+  const byId = new Map(members.map(m => [m.id, m]));
+  const debtors = [];
+  const creditors = [];
+  for (const id of [...bal.keys()].sort((a, b) => a - b)) {
+    const v = bal.get(id);
+    if (v < -1) debtors.push({ id, amt: -v });
+    else if (v > 1) creditors.push({ id, amt: v });
+  }
+  debtors.sort((a, b) => b.amt - a.amt);
+  creditors.sort((a, b) => b.amt - a.amt);
+
+  const settlements = [];
+  let di = 0, ci = 0;
+  while (di < debtors.length && ci < creditors.length) {
+    const pay = Math.min(debtors[di].amt, creditors[ci].amt);
+    if (pay > 0) {
+      const fromMember = byId.get(debtors[di].id);
+      const toMember = byId.get(creditors[ci].id);
+      settlements.push({
+        from: debtors[di].id,
+        to: creditors[ci].id,
+        amt: pay / 100,
+        fromName: fromMember?.name,
+        toName: toMember?.name,
+      });
+    }
+    debtors[di].amt -= pay;
+    creditors[ci].amt -= pay;
+    if (debtors[di].amt < 1) di++;
+    if (creditors[ci].amt < 1) ci++;
+  }
+  return settlements;
 }
 
 export function createGroup(name, createdBy) {
